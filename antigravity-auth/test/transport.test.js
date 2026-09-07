@@ -644,4 +644,34 @@ describe("native architecture improvements", () => {
     assert.ok(plugin.auth.loader);
     assert.equal(plugin.auth.methods[0].type, "oauth");
   });
+  it("verifies anti-ban enhancements: sanitized system prompt, trajectory requestId, and desktop UA", () => {
+    const env = buildEnvelope(
+      {
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+        systemInstruction: {
+          role: "system",
+          parts: [
+            { text: "You are a Claude agent, built on Anthropic's Claude Agent SDK. Running on OpenCode." },
+          ],
+        },
+      },
+      { projectId: "test-proj", modelId: "gemini-3-flash" },
+    );
+
+    // 1. Verify trajectory requestId format
+    assert.match(env.requestId, /^agent\/[a-zA-Z0-9_-]+\/\d+\/[a-f0-9]+\/\d+$/);
+
+    // 2. Verify prompt sanitization (removed Claude Agent SDK branding and rewritten OpenCode to Antigravity)
+    const sysParts = env.request?.systemInstruction?.parts || [];
+    const sanitizedPart = sysParts.find((p) => p.text?.includes("Running on Antigravity."));
+    assert.ok(sanitizedPart, "Expected OpenCode branding to be rewritten to Antigravity");
+    assert.ok(!sanitizedPart.text.includes("Claude Agent SDK"), "Expected Claude Agent SDK branding to be stripped");
+
+    // 3. Verify desktop User-Agent without leaking VSCode cloud shell headers
+    delete process.env.OPENCODE_AGY_UA_MODE;
+    const headers = getAntigravityHeaders("gemini-3-flash");
+    assert.match(headers["User-Agent"], /^antigravity\/ide\/2\.11\.0/);
+    assert.equal(headers["X-Goog-Api-Client"], undefined, "Expected X-Goog-Api-Client to be stripped");
+    assert.equal(headers["x-request-source"], "local");
+  });
 });

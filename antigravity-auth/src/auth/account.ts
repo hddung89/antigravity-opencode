@@ -38,26 +38,66 @@ export async function getUserEmail(accessToken: string): Promise<string | undefi
  * Discover Cloud AI Companion project via loadCodeAssist, falling back
  * to a deterministic stableProjectId(email) if none is configured.
  */
+export async function onboardUser(
+  accessToken: string,
+  endpoint = DEFAULT_ENDPOINT,
+  tierId = "legacy-tier",
+): Promise<boolean> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "User-Agent": "google-api-nodejs-client/9.15.1",
+    "x-request-source": "local",
+  };
+  const body = JSON.stringify({
+    tierId,
+    metadata: {
+      ideType: "ANTIGRAVITY",
+      platform: process.platform === "darwin" ? "MACOS" : process.platform === "win32" ? "WINDOWS" : "LINUX",
+      pluginType: "GEMINI",
+    },
+  });
+
+  for (let i = 0; i < 5; i++) {
+    try {
+      const res = await fetch(`${endpoint}/v1internal:onboardUser`, {
+        method: "POST",
+        headers,
+        body,
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { done?: boolean };
+        if (data.done === true) return true;
+      }
+    } catch {
+      // ignore and retry
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  return false;
+}
+
+/**
+ * Discover Cloud AI Companion project via loadCodeAssist, falling back
+ * to onboardUser or a deterministic stableProjectId(email) if none is configured.
+ */
 export async function discoverProject(accessToken: string, userEmail?: string): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
     "Content-Type": "application/json",
     "User-Agent": "google-api-nodejs-client/9.15.1",
-    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-    "Client-Metadata": JSON.stringify({
-      ideType: "IDE_UNSPECIFIED",
-      platform: "PLATFORM_UNSPECIFIED",
-      pluginType: "GEMINI",
-    }),
+    "x-request-source": "local",
   };
   const endpoints = [DEFAULT_ENDPOINT, ANTIGRAVITY_DAILY];
   const body = JSON.stringify({
     metadata: {
-      ideType: "IDE_UNSPECIFIED",
-      platform: "PLATFORM_UNSPECIFIED",
+      ideType: "ANTIGRAVITY",
+      platform: process.platform === "darwin" ? "MACOS" : process.platform === "win32" ? "WINDOWS" : "LINUX",
       pluginType: "GEMINI",
     },
   });
+
+  let defaultTierId = "legacy-tier";
 
   for (const endpoint of endpoints) {
     try {
@@ -69,8 +109,19 @@ export async function discoverProject(accessToken: string, userEmail?: string): 
       if (!loadResponse.ok) continue;
       const data = (await loadResponse.json()) as {
         cloudaicompanionProject?: string | { id?: string };
+        allowedTiers?: Array<{ id?: string; isDefault?: boolean }>;
       };
+      if (Array.isArray(data.allowedTiers)) {
+        for (const tier of data.allowedTiers) {
+          if (tier.isDefault && tier.id) {
+            defaultTierId = tier.id.trim();
+            break;
+          }
+        }
+      }
       if (typeof data.cloudaicompanionProject === "string" && data.cloudaicompanionProject) {
+        // Fire background onboarding if project exists
+        onboardUser(accessToken, endpoint, defaultTierId).catch(() => {});
         return data.cloudaicompanionProject;
       }
       if (
@@ -78,6 +129,7 @@ export async function discoverProject(accessToken: string, userEmail?: string): 
         typeof data.cloudaicompanionProject === "object" &&
         data.cloudaicompanionProject.id
       ) {
+        onboardUser(accessToken, endpoint, defaultTierId).catch(() => {});
         return data.cloudaicompanionProject.id;
       }
     } catch {

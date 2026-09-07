@@ -235,15 +235,30 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
           }
 
           const ct = response.headers.get("content-type") || "";
+          const shouldCloak = process.env.OPENCODE_AGY_CLOAK_TOOLS === "1";
           if (stream && response.body && ct.includes("text/event-stream")) {
-            return new Response(unwrapSseResponseStream(response.body), {
+            let sseStream = unwrapSseResponseStream(response.body);
+            if (shouldCloak) {
+              const transform = new TransformStream({
+                transform(chunk, controller) {
+                  const text = new TextDecoder().decode(chunk);
+                  const uncloaked = text.replaceAll(`_ide"`, `"`);
+                  controller.enqueue(new TextEncoder().encode(uncloaked));
+                },
+              });
+              sseStream = sseStream.pipeThrough(transform);
+            }
+            return new Response(sseStream, {
               status: response.status,
               statusText: response.statusText,
               headers: response.headers,
             });
           }
 
-          const text = await response.text();
+          let text = await response.text();
+          if (shouldCloak) {
+            text = text.replaceAll(`_ide"`, `"`);
+          }
           try {
             const parsed = JSON.parse(text);
             if (parsed && typeof parsed === "object" && parsed.response) {
