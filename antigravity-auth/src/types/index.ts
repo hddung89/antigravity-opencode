@@ -122,7 +122,6 @@ export interface AntigravityEnvelope {
   project: string;
   model: string;
   request: AntigravityEnvelopeRequest;
-  requestType?: "agent" | string;
   userAgent: "antigravity" | "opencode" | string;
   requestId: string;
 }
@@ -173,4 +172,9 @@ export interface AntigravityFetchDeps {
   getAccessToken: (opts?: { forceRefresh?: boolean }) => Promise<string>;
   getProjectId: () => Promise<string>;
   fetchImpl?: typeof fetch;
+  /**
+   * Rotate to a sibling Antigravity account on quota exhaustion. Returns the
+   * rotated credentials, or null when no sibling account is available.
+   */
+  rotateAccount?: () => Promise<{ accessToken: string; projectId: string } | null>;
 }

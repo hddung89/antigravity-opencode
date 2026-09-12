@@ -45,22 +45,34 @@ export function writeMeta(
   return next;
 }
 
+export function getAuthCredentialsFor(providerId: string): {
+  access: string;
+  refresh: string;
+  expires?: number;
+  accountId?: string;
+  enterpriseUrl?: string;
+} | null {
+  const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+  if (!existsSync(authPath)) return null;
+  try {
+    const data = JSON.parse(readFileSync(authPath, "utf8"));
+    const entry = data[providerId];
+    if (entry && entry.access && entry.refresh) return entry;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function getStoredAuthCredentials(): {
   access: string;
   refresh: string;
   expires?: number;
   accountId?: string;
 } | null {
-  const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
-  if (!existsSync(authPath)) return null;
-  try {
-    const data = JSON.parse(readFileSync(authPath, "utf8"));
-    const agy = data["google-antigravity"] || data["antigravity"];
-    if (agy && agy.access && agy.refresh) return agy;
-  } catch {
-    return null;
-  }
-  return null;
+  return (
+    getAuthCredentialsFor("google-antigravity") ?? getAuthCredentialsFor("antigravity")
+  );
 }
 
 export async function resolveStoredAccessToken(): Promise<{ access: string; projectId: string } | null> {

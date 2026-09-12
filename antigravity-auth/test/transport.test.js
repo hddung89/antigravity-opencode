@@ -71,7 +71,7 @@ describe("transport", () => {
     assert.equal(isGoogleGenerativeUrl("https://api.openai.com/v1/chat/completions"), false);
   });
 
-  it("builds antigravity envelope preserving tools + injects system", () => {
+  it("builds antigravity envelope preserving tools + session identity", () => {
     const geminiBody = {
       contents: [{ role: "user", parts: [{ text: "hi" }] }],
       tools: [{ functionDeclarations: [{ name: "bash", description: "run", parameters: { type: "object" } }] }],
@@ -80,13 +80,18 @@ describe("transport", () => {
     const env = buildEnvelope(geminiBody, { projectId: "proj-1", modelId: "gemini-3-flash" });
     assert.equal(env.project, "proj-1");
     assert.equal(env.model, "gemini-3-flash");
-    assert.equal(env.requestType, "agent");
+    // requestType is deliberately omitted: the official client does not send
+    // it on consumer Cloud Code and "agent" lands in a constrained bucket.
+    assert.equal(env.requestType, undefined);
     assert.equal(env.userAgent, "antigravity");
     assert.equal(env.request.tools[0].functionDeclarations[0].name, "bash");
-    // OpenClaw omits sessionId unless caller supplies it
-    assert.equal(env.request.sessionId, undefined);
-    assert.ok(env.request.systemInstruction.parts.some((p) => String(p.text).includes("You are Antigravity")));
-    assert.equal(env.request.systemInstruction.role, "user");
+    // Antigravity requests always carry a signed-decimal int63 sessionId and
+    // telemetry labels (trajectory_id, last_step_index, model_enum).
+    assert.match(env.request.sessionId, /^-?\d+$/);
+    assert.equal(env.request.labels.trajectory_id.length > 0, true);
+    assert.equal(env.request.labels.last_step_index, "0");
+    // No caller systemInstruction -> nothing injected (matches real client).
+    assert.equal(env.request.systemInstruction, undefined);
   });
 
   it("adapts Claude tools to sanitized legacy parameters", () => {
@@ -202,7 +207,7 @@ describe("transport", () => {
 
     process.env.OPENCODE_AGY_UA_MODE = "sdk";
     const hSdk = getAntigravityHeaders("gemini-3-flash");
-    assert.match(hSdk["User-Agent"], /^antigravity\/1\.21\.9/);
+    assert.match(hSdk["User-Agent"], /^antigravity\/\d+\.\d+\.\d+ /);
     delete process.env.OPENCODE_AGY_UA_MODE;
 
     process.env.OPENCODE_AGY_UA_MODE = "desktop";
@@ -659,7 +664,7 @@ describe("native architecture improvements", () => {
     );
 
     // 1. Verify trajectory requestId format
-    assert.match(env.requestId, /^agent\/[a-zA-Z0-9_-]+\/\d+\/[a-f0-9]+\/\d+$/);
+    assert.match(env.requestId, /^agent\/[0-9a-f-]+\/\d+\/[0-9a-f-]+\/\d+$/);
 
     // 2. Verify prompt sanitization (removed Claude Agent SDK branding and rewritten OpenCode to Antigravity)
     const sysParts = env.request?.systemInstruction?.parts || [];

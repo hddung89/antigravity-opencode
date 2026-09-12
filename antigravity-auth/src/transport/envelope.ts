@@ -13,9 +13,12 @@ import {
   isGeminiProLow,
 } from "../models/thinking.js";
 import { ANTIGRAVITY_MODEL_CATALOG } from "../models/catalog.js";
+import { ANTIGRAVITY_MODEL_WIRE_PROFILES } from "../models/wire-profiles.js";
 import { resolveWireModelId } from "../models/aliases.js";
 import { dereferenceSchema, ensureRootObjectSchema, sanitizeForOpenApi } from "../utils/schema.js";
-import { injectAntigravitySystem } from "../utils/system.js";
+import { sanitizeSystemInstruction } from "../utils/system.js";
+import { getAntigravityVersion } from "./version.js";
+import { buildSessionEnvelope } from "./session.js";
 import type { AntigravityEnvelope, GeminiContent, GeminiPart } from "../types/index.js";
 
 export function isClaudeModel(modelId: string): boolean {
@@ -77,19 +80,18 @@ export function getAntigravityHeaders(modelId = ""): Record<string, string> {
   const arch = process.arch === "arm64" ? "arm64" : "amd64";
 
   let userAgentStr: string;
-  if (process.env.OPENCODE_AGY_UA_MODE) {
-    const uaMode = process.env.OPENCODE_AGY_UA_MODE.toLowerCase();
-    if (uaMode === "sdk") {
-      userAgentStr = `antigravity/${process.env.PI_AI_ANTIGRAVITY_VERSION || "1.21.9"} ${platform}/${arch}`;
-    } else if (uaMode === "desktop") {
-      userAgentStr = `Antigravity/${process.env.PI_AI_ANTIGRAVITY_VERSION || "2.2.1"} ${platform}/${arch}`;
-    } else {
-      const cliVer = process.env.PI_AI_ANTIGRAVITY_VERSION || "1.1.13";
-      userAgentStr = `antigravity/cli/${cliVer} (aidev_client; os_type=${platform}; arch=${arch}; auth_method=consumer)`;
-    }
+  const uaMode = (process.env.OPENCODE_AGY_UA_MODE || "ide").toLowerCase();
+  if (uaMode === "sdk") {
+    userAgentStr = `antigravity/${getAntigravityVersion()} ${platform}/${arch}`;
+  } else if (uaMode === "desktop") {
+    userAgentStr = `Antigravity/${getAntigravityVersion()} ${platform}/${arch}`;
+  } else if (uaMode === "cli") {
+    const cliVer = process.env.PI_AI_ANTIGRAVITY_VERSION || "1.1.13";
+    userAgentStr = `antigravity/cli/${cliVer} (aidev_client; os_type=${platform}; arch=${arch}; auth_method=consumer)`;
   } else {
-    // Default to official Antigravity IDE desktop fingerprint
-    userAgentStr = `antigravity/ide/2.11.0 ${platform}/${arch}`;
+    // Default to official Antigravity IDE desktop fingerprint; the version
+    // auto-tracks the latest release via the electron-builder update manifest.
+    userAgentStr = `antigravity/ide/${getAntigravityVersion()} ${platform}/${arch}`;
   }
 
   const headers: Record<string, string> = {
@@ -173,6 +175,9 @@ export function postProcessContents(contents: GeminiContent[], modelId: string):
     .map((content) => {
       if (!content || !Array.isArray(content.parts)) return content;
       const parts: GeminiPart[] = [];
+      // The real client attaches the sentinel only to the first unsigned
+      // functionCall of each model turn; later unsigned calls stay bare.
+      let isFirstToolCall = true;
 
       for (const part of content.parts) {
         if (!part || typeof part !== "object") {
@@ -204,9 +209,10 @@ export function postProcessContents(contents: GeminiContent[], modelId: string):
             }
           }
           next.functionCall = fc;
-          if (gemini3 && !next.thoughtSignature && !fc.thoughtSignature) {
+          if (gemini3 && isFirstToolCall && !next.thoughtSignature && !fc.thoughtSignature) {
             next.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
           }
+          isFirstToolCall = false;
         }
 
         if (next.functionResponse && typeof next.functionResponse === "object") {
@@ -250,6 +256,34 @@ export function postProcessGeminiBody(
   } else if (isGemini3Model(modelId) || isGeminiProHigh(modelId) || isGeminiProLow(modelId)) {
     body.generationConfig = sanitizeGenerationConfig({}, modelId);
   }
+
+  // The real client pins `maxOutputTokens` per wire id regardless of the
+  // requested budget (Claude caps at 64000, Gemini at the discovered cap).
+  const profile = ANTIGRAVITY_MODEL_WIRE_PROFILES[modelId];
+  if (profile) {
+    body.generationConfig = {
+      ...((body.generationConfig as Record<string, unknown> | undefined) ?? {}),
+      maxOutputTokens: profile.maxOutputTokens,
+    };
+  }
+
+  // The real client always sends functionCallingConfig.mode "VALIDATED" —
+  // Claude even without tools. An explicit caller toolConfig wins.
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  if (isClaudeModel(modelId) || (hasTools && body.toolConfig == null)) {
+    const existing =
+      body.toolConfig && typeof body.toolConfig === "object"
+        ? (body.toolConfig as Record<string, unknown>)
+        : {};
+    const existingFcc =
+      existing.functionCallingConfig && typeof existing.functionCallingConfig === "object"
+        ? (existing.functionCallingConfig as Record<string, unknown>)
+        : {};
+    body.toolConfig = {
+      ...existing,
+      functionCallingConfig: { ...existingFcc, mode: "VALIDATED" },
+    };
+  }
   return body;
 }
 
@@ -268,27 +302,40 @@ export function buildEnvelope(
   const wireModelId = resolveWireModelId(opts.modelId);
   let request = postProcessGeminiBody({ ...geminiBody }, wireModelId);
 
-  if (opts.sessionId) {
-    request.sessionId = opts.sessionId;
-  } else if (request.sessionId == null) {
-    delete request.sessionId;
-  }
-
   if (isAntigravity) {
-    request = injectAntigravitySystem(request);
+    request = sanitizeSystemInstruction(request);
   }
 
   let requestId: string;
+  let sessionId: string | undefined;
+  let labels: Record<string, string> | undefined;
   if (isAntigravity) {
-    const sessionId = opts.sessionId || (typeof request.sessionId === "string" ? request.sessionId : "default");
-    const contents = Array.isArray(request.contents) ? request.contents : [];
-    const step = Math.max(1, contents.length * 2 - 1);
-    const convHash = randomBytes(6).toString("hex");
-    const trajHash = randomBytes(6).toString("hex");
-    // If sessionId is provided, embed prefix to maintain trace correlation
-    const safeSession = sessionId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16);
-    requestId = `agent/${safeSession || convHash}/${Date.now()}/${trajHash}/${step}`;
+    // Persistent per-conversation identity: UUID agentId/trajectoryId,
+    // monotonic step, signed-decimal int63 sessionId, telemetry labels.
+    // `requestType` is deliberately omitted — the official client does not
+    // send it on consumer Cloud Code, and "agent" is a constrained bucket
+    // that answers with a detail-free 429 RESOURCE_EXHAUSTED.
+    const session = buildSessionEnvelope({
+      contents: Array.isArray(request.contents)
+        ? (request.contents as GeminiContent[])
+        : undefined,
+      wireModelId,
+      claude: isClaudeModel(wireModelId),
+      sessionId: opts.sessionId,
+    });
+    sessionId = session.sessionId;
+    requestId = session.requestId;
+    labels = session.labels;
+    request.sessionId = sessionId;
+    if (Object.keys(labels).length > 0) {
+      request.labels = labels;
+    }
   } else {
+    if (opts.sessionId) {
+      request.sessionId = opts.sessionId;
+    } else if (request.sessionId == null) {
+      delete request.sessionId;
+    }
     const hexRandom = randomBytes(4).toString("hex");
     requestId = `oc-${Date.now()}-${hexRandom}`;
   }
@@ -297,7 +344,6 @@ export function buildEnvelope(
     project: opts.projectId,
     model: wireModelId,
     request,
-    ...(isAntigravity ? { requestType: "agent" } : {}),
     userAgent: isAntigravity ? "antigravity" : "opencode",
     requestId,
   };

@@ -115,7 +115,7 @@ describe("P2: Image Generation module", () => {
     assert.equal(req.model, "gemini-3-pro-image");
     assert.equal(req.request.generationConfig.imageConfig.aspectRatio, "16:9");
     assert.equal(req.request.contents[0].parts[0].text, "a red sports car");
-    assert.equal(req.requestType, "agent");
+    assert.equal(req.requestType, undefined);
     assert.equal(req.userAgent, "antigravity");
   });
 });

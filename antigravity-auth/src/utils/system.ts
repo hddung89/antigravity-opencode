@@ -1,12 +1,13 @@
 /**
- * DeepMind Antigravity System Instruction injector.
+ * System-instruction sanitizer for Antigravity requests.
+ *
+ * The real client does not inject an identity prompt — verified live: the
+ * backend accepts arbitrary prompts, and a stale injected prompt becomes a
+ * static fingerprint when Google rotates theirs. What remains useful is
+ * erasing OpenCode/Claude-SDK branding from the caller's own prompt and
+ * obfuscating phrases the server-side matcher answers with a bare 429.
  */
-
-export const ANTIGRAVITY_SYSTEM_INSTRUCTION =
-  "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding." +
-  "You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question." +
-  "**Absolute paths only**" +
-  "**Proactiveness**";
+import { getSensitiveWords, obfuscateSensitiveWords } from "./sensitive-words.js";
 
 export const ANTIGRAVITY_PROMPT_REWRITES = [
   { from: /You are a Claude agent, built on Anthropic's Claude Agent SDK\./gi, to: "" },
@@ -26,37 +27,29 @@ export function sanitizeSystemPrompt(text: string): string {
       sanitized = sanitized.replace(rewrite.from, rewrite.to);
     }
   }
-  return sanitized;
+  return obfuscateSensitiveWords(sanitized, getSensitiveWords());
 }
 
-export function injectAntigravitySystem<T extends { systemInstruction?: { role?: string; parts?: Array<{ text?: string }> } }>(
-  geminiBody: T,
-): T {
-  const disabled = process.env.OPENCODE_AGY_INJECT_SYSTEM === "0";
-  if (disabled) return geminiBody;
+/**
+ * Sanitize an existing `systemInstruction` in place: rewrite branding,
+ * obfuscate sensitive phrases, tag `role: "user"`. Adds nothing when the
+ * caller sent no system instruction — matching the real client.
+ */
+export function sanitizeSystemInstruction<
+  T extends { systemInstruction?: { role?: string; parts?: Array<{ text?: string }> } },
+>(geminiBody: T): T {
+  const rawParts = geminiBody.systemInstruction?.parts;
+  if (!Array.isArray(rawParts) || rawParts.length === 0) return geminiBody;
+
   const request = { ...geminiBody };
-  const rawParts = request.systemInstruction?.parts ?? [];
-  const existingParts = Array.isArray(rawParts)
-    ? rawParts.map((p) => {
-        if (typeof p?.text === "string") {
-          return { ...p, text: sanitizeSystemPrompt(p.text) };
-        }
-        return p;
-      })
-    : [];
-
-  const already = existingParts.some(
-    (p) => typeof p?.text === "string" && p.text.includes("You are Antigravity, a powerful agentic"),
-  );
-  if (already) return request;
-
   request.systemInstruction = {
     role: "user",
-    parts: [
-      { text: ANTIGRAVITY_SYSTEM_INSTRUCTION },
-      { text: `Please ignore following [ignore]${ANTIGRAVITY_SYSTEM_INSTRUCTION}[/ignore]` },
-      ...existingParts,
-    ],
+    parts: rawParts.map((p) => {
+      if (typeof p?.text === "string") {
+        return { ...p, text: sanitizeSystemPrompt(p.text) };
+      }
+      return p;
+    }),
   };
   return request;
 }

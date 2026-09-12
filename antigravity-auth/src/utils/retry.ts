@@ -56,3 +56,44 @@ export function extractRetryDelay(
 
   return null;
 }
+
+/**
+ * Classify a 429 body using `google.rpc.ErrorInfo` reasons and the
+ * capacity-exhaustion phrasing the Antigravity backend emits.
+ * Ported from oh-my-pi `packages/ai/src/error/rate-limit.ts`.
+ */
+export type AntigravityRateLimitReason =
+  | "QUOTA_EXHAUSTED"
+  | "RATE_LIMIT_EXCEEDED"
+  | "INSUFFICIENT_G1_CREDITS_BALANCE";
+
+const GOOGLE_RPC_ERROR_INFO_TYPE = "type.googleapis.com/google.rpc.ErrorInfo";
+const ANTIGRAVITY_MODEL_QUOTA_PATTERN = /\bexhausted your capacity on this model\b/i;
+
+export function parseAntigravityRateLimitReason(
+  errorText: string,
+): AntigravityRateLimitReason | undefined {
+  if (!errorText) return undefined;
+  try {
+    const parsed = JSON.parse(errorText) as Record<string, unknown>;
+    const details = (parsed?.error as Record<string, unknown> | undefined)?.details;
+    if (Array.isArray(details)) {
+      for (const detail of details) {
+        const record = detail as Record<string, unknown>;
+        if (record?.["@type"] !== GOOGLE_RPC_ERROR_INFO_TYPE) continue;
+        const reason = record.reason;
+        if (
+          reason === "QUOTA_EXHAUSTED" ||
+          reason === "RATE_LIMIT_EXCEEDED" ||
+          reason === "INSUFFICIENT_G1_CREDITS_BALANCE"
+        ) {
+          return reason;
+        }
+      }
+    }
+  } catch {
+    // fall through to text matching
+  }
+  if (ANTIGRAVITY_MODEL_QUOTA_PATTERN.test(errorText)) return "QUOTA_EXHAUSTED";
+  return undefined;
+}

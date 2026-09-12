@@ -4,7 +4,10 @@
  * so @ai-sdk/google can parse chunks as native Gemini SSE.
  */
 
-export function transformSseDataLine(line: string): string {
+export function transformSseDataLine(
+  line: string,
+  onResponseId?: (responseId: string) => void,
+): string {
   const m = line.match(/^data:\s?(.*)$/);
   if (!m) return line;
   const jsonStr = m[1]?.trim() ?? "";
@@ -13,8 +16,15 @@ export function transformSseDataLine(line: string): string {
   }
   try {
     const parsed = JSON.parse(jsonStr);
-    if (parsed && typeof parsed === "object" && "response" in parsed && parsed.response != null) {
-      return `data: ${JSON.stringify(parsed.response)}`;
+    if (parsed && typeof parsed === "object") {
+      const responseId =
+        (parsed as Record<string, unknown>).responseId ??
+        ((parsed as Record<string, unknown>).response as Record<string, unknown> | undefined)
+          ?.responseId;
+      if (typeof responseId === "string" && responseId) onResponseId?.(responseId);
+      if ("response" in parsed && parsed.response != null) {
+        return `data: ${JSON.stringify(parsed.response)}`;
+      }
     }
   } catch {
     // leave unmodified if JSON parsing fails
@@ -22,7 +32,10 @@ export function transformSseDataLine(line: string): string {
   return line;
 }
 
-export function unwrapSseResponseStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+export function unwrapSseResponseStream(
+  body: ReadableStream<Uint8Array>,
+  onResponseId?: (responseId: string) => void,
+): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
@@ -38,7 +51,7 @@ export function unwrapSseResponseStream(body: ReadableStream<Uint8Array>): Reada
             if (buffer.length) {
               const rest = buffer.replace(/\r$/, "");
               if (rest.startsWith("data:")) {
-                controller.enqueue(encoder.encode(transformSseDataLine(rest) + "\n"));
+                controller.enqueue(encoder.encode(transformSseDataLine(rest, onResponseId) + "\n"));
               } else if (rest.trim()) {
                 controller.enqueue(encoder.encode(rest));
               }
@@ -53,7 +66,7 @@ export function unwrapSseResponseStream(body: ReadableStream<Uint8Array>): Reada
           let out = "";
           for (const line of lines) {
             if (line.startsWith("data:")) {
-              out += transformSseDataLine(line) + "\n";
+              out += transformSseDataLine(line, onResponseId) + "\n";
             } else {
               out += line + "\n";
             }

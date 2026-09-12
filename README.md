@@ -397,13 +397,13 @@ Bạn có thể tùy chỉnh hành vi của plugin thông qua các biến môi t
 
 | Biến môi trường | Mặc định | Ý nghĩa & Tùy chọn |
 |---|---|---|
-| `OPENCODE_AGY_UA_MODE` | `cli` | Chế độ User-Agent gửi tới Google API:<br>• `cli` (khuyên dùng): `antigravity/cli/<ver>` — **bắt buộc để backend cấp các model mới nhất như Gemini 3.7/3.8**<br>• `sdk`: `antigravity/<ver>`<br>• `desktop`: `Antigravity/<ver>` |
-| `PI_AI_ANTIGRAVITY_VERSION` | `1.1.13` (cli) | Ghi đè chuỗi phiên bản trong User-Agent |
+| `OPENCODE_AGY_UA_MODE` | `ide` | Chế độ User-Agent gửi tới Google API:<br>• `ide` (mặc định): `antigravity/ide/<ver> <platform>/<arch>` — version **tự động theo bản release mới nhất** qua update manifest của electron-builder<br>• `cli`: `antigravity/cli/<ver>` kèm `aidev_client` metadata<br>• `sdk`: `antigravity/<ver>`<br>• `desktop`: `Antigravity/<ver>` |
+| `PI_AI_ANTIGRAVITY_VERSION` | *(auto)* | Ghi đè chuỗi phiên bản trong User-Agent (bỏ qua auto-track manifest) |
 | `ANTIGRAVITY_PROJECT_ID` | *(auto)* | Ghi đè Project ID chỉ định thay vì dùng tự động phát hiện |
 | `OPENCODE_AGY_NO_KEEPALIVE` | `0` | Đặt `=1` để tắt Connection Pool (Undici Agent) và fallback về fetch chuẩn |
 | `OPENCODE_AGY_NO_PREWARM` | `0` | Đặt `=1` để tắt tính năng tiền kết nối (TLS handshake prewarm) trong background |
 | `OPENCODE_AGY_HTTP2` | `0` | Đặt `=1` để bật hỗ trợ giao thức HTTP/2 trên Undici Connection Pool |
-| `OPENCODE_AGY_INJECT_SYSTEM` | `1` | Đặt `=0` để tắt chèn DeepMind Antigravity System Instruction mặc định |
+| `OPENCODE_AGY_SENSITIVE_WORDS` | `RFC 2119` | Danh sách cụm từ nhạy cảm (phân tách bằng dấu phẩy) được chèn zero-width space vào `systemInstruction` để phá server-side literal matcher (tránh bare-429). Đặt rỗng để tắt |
 | `OPENCODE_AGY_DEBUG` | `0` | Đặt `=1` để ghi chi tiết request/response envelope khi gặp lỗi ra `/tmp/agy-debug-*.json` (tự lọc bỏ token nhạy cảm) |
 
 ---
@@ -455,9 +455,9 @@ Plugin chặn và tái cấu trúc toàn bộ tầng fetch của `@ai-sdk/google
                    ├─ 2. adaptToolsForModel(): Đệ quy giải quyết $defs/$ref, sanitize OpenAPI schema
                    ├─ 3. postProcessContents(): Chèn Gemini 3 thoughtSignature, chuẩn hóa Tool Call IDs
                    ├─ 4. sanitizeGenerationConfig(): Chuyển thinkingBudget → thinkingLevel (HIGH/MEDIUM/LOW), floor 3.7+ MINIMAL→LOW
-                   ├─ 5. injectAntigravitySystem(): Chèn DeepMind System Instruction vào đầu request
-                   ├─ 6. buildEnvelope(): Đóng gói Outer Envelope { project, model, request, requestType: "agent", userAgent: "antigravity", requestId }
-                   ├─ 7. getAntigravityHeaders(): Bổ sung User-Agent CLI, client metadata, anthropic-beta header (cho Claude)
+                   ├─ 5. sanitizeSystemInstruction(): Xóa branding OpenCode/Claude-SDK, obfuscate cụm từ nhạy cảm (U+200B), tag role "user"
+                   ├─ 6. buildEnvelope(): Đóng gói Outer Envelope { project, model, request, userAgent: "antigravity", requestId } — KHÔNG gửi requestType (bucket "agent" bị bare-429)
+                   ├─ 7. getAntigravityHeaders(): Bổ sung User-Agent IDE, client metadata, anthropic-beta header (cho Claude)
                    ├─ 8. antigravityFetch(): Gửi request qua Undici keep-alive pool (hỗ trợ TLS prewarming)
                    │     POST → /v1internal:streamGenerateContent?alt=sse
                    │
@@ -466,16 +466,15 @@ Plugin chặn và tái cấu trúc toàn bộ tầng fetch của `@ai-sdk/google
 
 ### Chuỗi Fallback Endpoints
 
-Plugin tự động điều hướng request qua 3 endpoint của Google Cloud Code Assist theo thứ tự ưu tiên:
+Plugin tự động điều hướng request qua 2 endpoint của Google Cloud Code Assist theo thứ tự ưu tiên (endpoint thành công gần nhất được ưu tiên thử trước):
 1. `https://daily-cloudcode-pa.sandbox.googleapis.com` (Thử trước tiên)
-2. `https://autopush-cloudcode-pa.sandbox.googleapis.com` (Fallback thứ hai)
-3. `https://cloudcode-pa.googleapis.com` (Production — Fallback cuối cùng)
+2. `https://cloudcode-pa.googleapis.com` (Production — Fallback cuối cùng)
 
 ### Ngụy trang 5 Vectơ Nhận diện Client
 
-1. **User-Agent & Client-Metadata**: Mô phỏng định dạng CLI chính thức của Antigravity kèm hệ điều hành và kiến trúc chip (`darwin/arm64`, `linux/amd64`, `windows/amd64`).
-2. **Outer Envelope**: Đúng schema của Antigravity Agent (`requestType: "agent"`, `userAgent: "antigravity"`).
-3. **DeepMind System Prompt**: Tự động ghép vào `systemInstruction.parts[0]`.
+1. **User-Agent & Client-Metadata**: Mô phỏng định dạng IDE chính thức của Antigravity kèm hệ điều hành và kiến trúc chip (`darwin/arm64`, `linux/amd64`, `windows/amd64`); version auto-track qua update manifest.
+2. **Outer Envelope**: Đúng schema của Antigravity Agent (`userAgent: "antigravity"`, `requestId` dạng `agent/<uuid>/<ts>/<uuid>/<step>` với trajectory persistent, labels telemetry đầy đủ). Không gửi `requestType` — client thật bỏ trống trên consumer Cloud Code.
+3. **System Prompt Sanitization**: Xóa dấu vết OpenCode/Claude-SDK khỏi systemInstruction của caller và obfuscate cụm từ nhạy cảm bằng zero-width space; không inject prompt giả (prompt cũ trở thành fingerprint tĩnh khi Google đổi prompt).
 4. **Thinking Configuration Enum**: Luôn chuẩn hóa thành `thinkingLevel` thay vì `thinkingBudget`.
 5. **SSE Stream Parsing Chuẩn**: Hỗ trợ xử lý incremental cả `\r\n` (CRLF) và `\n` (LF) mà không cần buffer toàn bộ stream.
 

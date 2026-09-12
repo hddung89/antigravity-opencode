@@ -101,7 +101,6 @@ export function buildImageGenerateRequest(
         candidateCount: 1,
       },
     },
-    requestType: "agent",
     userAgent: "antigravity",
     requestId: `agent-img-${Date.now()}-${hex}`,
   };

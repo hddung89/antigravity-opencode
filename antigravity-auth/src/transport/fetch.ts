@@ -5,15 +5,19 @@
  */
 import { ENDPOINT_FALLBACKS, DEFAULT_ENDPOINT } from "../auth/constants.js";
 import { resolveWireModelId } from "../models/aliases.js";
-import { extractRetryDelay } from "../utils/retry.js";
+import { extractRetryDelay, parseAntigravityRateLimitReason } from "../utils/retry.js";
 import { antigravityFetch, prewarmConnection } from "../utils/http.js";
 import { buildEnvelope, getAntigravityHeaders } from "./envelope.js";
 import { unwrapSseResponseStream } from "./stream.js";
+import { ensureAntigravityVersion } from "./version.js";
+import { getLastGoodEndpoint, recordExecutionId, setLastGoodEndpoint } from "./session.js";
 import type { AntigravityFetchDeps } from "../types/index.js";
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 60_000;
+/** Fail over when the first SSE event has not arrived within this window. */
+const FIRST_EVENT_WATCHDOG_MS = 60_000;
 
 export function extractModelIdFromUrl(urlString: string): string | undefined {
   try {
@@ -66,6 +70,75 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
       reject(new Error("Request was aborted"));
     };
     signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Read the first SSE chunk with a watchdog. Returns the chunk, or null when the
+ * stream stalled past `timeoutMs` (caller should fail over to the next endpoint).
+ * Throws on abort or stream error.
+ */
+async function readFirstSseChunk(
+  body: ReadableStream<Uint8Array>,
+  timeoutMs: number,
+  signal?: AbortSignal | null,
+): Promise<Uint8Array | null> {
+  const reader = body.getReader();
+  let timer: NodeJS.Timeout | undefined;
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+  try {
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+    if (result === "timeout") {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    if (result.done || !result.value) return null;
+    return result.value;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener?.("abort", onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Rebuild a stream that yields `first` before the remaining body. */
+function prependChunk(first: Uint8Array, body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      controller.enqueue(first);
+      const reader = body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) controller.enqueue(value);
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+      }
+    },
+    async cancel(reason) {
+      await body.cancel(reason).catch(() => {});
+    },
   });
 }
 
@@ -123,47 +196,63 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
       }
     }
 
+    // Track the newest Antigravity client version in the background so the UA
+    // fingerprint does not go stale between releases.
+    ensureAntigravityVersion().catch(() => {});
+
+    const wireModelId = resolveWireModelId(modelId);
+
+    let accessToken = await deps.getAccessToken();
+    let projectId = await deps.getProjectId();
+    if (!accessToken || !projectId) {
+      throw new Error(
+        "Antigravity credentials missing access token or projectId. Run: opencode auth login",
+      );
+    }
+
+    // Envelope is built once per request so requestId/labels stay stable across
+    // retries — the real client does not mint a new identity on retry.
+    const envelope = buildEnvelope(geminiBody, {
+      projectId,
+      modelId: wireModelId,
+      isAntigravity: true,
+    });
+    let envelopeJson = JSON.stringify(envelope);
+    const sessionId =
+      typeof envelope.request?.sessionId === "string" ? envelope.request.sessionId : undefined;
+
+    const headers = new Headers();
+    const rawHeaders =
+      init.headers || (typeof input === "object" && input !== null ? (input as any).headers : undefined);
+    if (rawHeaders) {
+      const h = new Headers(rawHeaders);
+      h.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk === "x-goog-api-key" || lk === "authorization") return;
+        headers.set(k, v);
+      });
+    }
+    headers.set("Authorization", `Bearer ${accessToken}`);
+    headers.set("Content-Type", "application/json");
+    headers.set("Accept", "text/event-stream");
+    for (const [k, v] of Object.entries(getAntigravityHeaders(wireModelId))) {
+      headers.set(k, v);
+    }
+
     let lastError: Error | undefined;
+    let rotated = false;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (signal?.aborted) throw new Error("Request was aborted");
 
-      const accessToken = await deps.getAccessToken();
-      const projectId = await deps.getProjectId();
-      if (!accessToken || !projectId) {
-        throw new Error(
-          "Antigravity credentials missing access token or projectId. Run: opencode auth login",
-        );
-      }
-
-      const wireModelId = resolveWireModelId(modelId);
-      const envelope = buildEnvelope(geminiBody, {
-        projectId,
-        modelId: wireModelId,
-        isAntigravity: true,
-      });
-      const envelopeJson = JSON.stringify(envelope);
-
-      const headers = new Headers();
-      const rawHeaders =
-        init.headers || (typeof input === "object" && input !== null ? (input as any).headers : undefined);
-      if (rawHeaders) {
-        const h = new Headers(rawHeaders);
-        h.forEach((v, k) => {
-          const lk = k.toLowerCase();
-          if (lk === "x-goog-api-key" || lk === "authorization") return;
-          headers.set(k, v);
-        });
-      }
-      headers.set("Authorization", `Bearer ${accessToken}`);
-      headers.set("Content-Type", "application/json");
-      headers.set("Accept", "text/event-stream");
-      for (const [k, v] of Object.entries(getAntigravityHeaders(wireModelId))) {
-        headers.set(k, v);
-      }
+      // Try the endpoint that last succeeded first; fall back to the static list.
+      const lastGood = getLastGoodEndpoint();
+      const endpoints = lastGood
+        ? [lastGood, ...ENDPOINT_FALLBACKS.filter((e) => e !== lastGood)]
+        : ENDPOINT_FALLBACKS;
 
       let endpointIndex = 0;
-      while (endpointIndex < ENDPOINT_FALLBACKS.length) {
-        const endpoint = ENDPOINT_FALLBACKS[endpointIndex];
+      while (endpointIndex < endpoints.length) {
+        const endpoint = endpoints[endpointIndex];
         const target = stream
           ? `${endpoint}/v1internal:streamGenerateContent?alt=sse`
           : `${endpoint}/v1internal:generateContent`;
@@ -178,7 +267,7 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
 
           if (
             (response.status === 403 || response.status === 404) &&
-            endpointIndex < ENDPOINT_FALLBACKS.length - 1
+            endpointIndex < endpoints.length - 1
           ) {
             endpointIndex++;
             lastError = new Error(`Antigravity ${response.status} at ${endpoint}`);
@@ -187,12 +276,45 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
 
           if (response.status === 401 && attempt < MAX_RETRIES) {
             lastError = new Error("Antigravity 401 unauthorized — refreshing token");
-            await deps.getAccessToken({ forceRefresh: true }).catch(() => null);
+            const refreshed = await deps.getAccessToken({ forceRefresh: true }).catch(() => null);
+            if (refreshed) {
+              accessToken = refreshed;
+              headers.set("Authorization", `Bearer ${accessToken}`);
+            }
             await sleep(200, signal);
             break;
           }
 
-          if (isRetryableStatus(response.status) && attempt < MAX_RETRIES) {
+          if (response.status === 429) {
+            const errText = await response.clone().text().catch(() => "");
+            const reason = parseAntigravityRateLimitReason(errText);
+            if (reason && deps.rotateAccount && !rotated) {
+              const rotatedCreds = await deps.rotateAccount().catch(() => null);
+              if (rotatedCreds) {
+                rotated = true;
+                accessToken = rotatedCreds.accessToken;
+                projectId = rotatedCreds.projectId;
+                envelope.project = projectId;
+                envelopeJson = JSON.stringify(envelope);
+                headers.set("Authorization", `Bearer ${accessToken}`);
+                lastError = new Error(`Antigravity 429 ${reason} — rotated account`);
+                break;
+              }
+            }
+            if (attempt < MAX_RETRIES) {
+              let delay = extractRetryDelay(errText, response) ?? BASE_DELAY_MS * 2 ** attempt;
+              delay = Math.min(delay, MAX_RETRY_DELAY_MS);
+              lastError = new Error(`Antigravity 429: ${errText.slice(0, 200)}`);
+              await sleep(delay, signal);
+              break;
+            }
+          }
+
+          if (
+            isRetryableStatus(response.status) &&
+            response.status !== 429 &&
+            attempt < MAX_RETRIES
+          ) {
             const errText = await response.clone().text().catch(() => "");
             let delay = extractRetryDelay(errText, response) ?? BASE_DELAY_MS * 2 ** attempt;
             delay = Math.min(delay, MAX_RETRY_DELAY_MS);
@@ -234,10 +356,33 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
             return response;
           }
 
+          setLastGoodEndpoint(endpoint);
+
           const ct = response.headers.get("content-type") || "";
           const shouldCloak = process.env.OPENCODE_AGY_CLOAK_TOOLS === "1";
           if (stream && response.body && ct.includes("text/event-stream")) {
-            let sseStream = unwrapSseResponseStream(response.body);
+            // First-event watchdog: a stalled stream fails over like a hung request.
+            const firstChunk = await readFirstSseChunk(
+              response.body,
+              FIRST_EVENT_WATCHDOG_MS,
+              signal,
+            );
+            if (!firstChunk) {
+              lastError = new Error(`Antigravity SSE first-event timeout at ${endpoint}`);
+              if (endpointIndex < endpoints.length - 1) {
+                endpointIndex++;
+                continue;
+              }
+              if (attempt < MAX_RETRIES) {
+                await sleep(BASE_DELAY_MS * 2 ** attempt, signal);
+                break;
+              }
+              throw lastError;
+            }
+            let sseStream = unwrapSseResponseStream(
+              prependChunk(firstChunk, response.body),
+              (responseId) => { if (sessionId) recordExecutionId(sessionId, responseId); },
+            );
             if (shouldCloak) {
               const transform = new TransformStream({
                 transform(chunk, controller) {
@@ -262,6 +407,10 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
           try {
             const parsed = JSON.parse(text);
             if (parsed && typeof parsed === "object" && parsed.response) {
+              const responseId = (parsed.response as Record<string, unknown>)?.responseId;
+              if (typeof responseId === "string" && responseId) {
+                if (sessionId) recordExecutionId(sessionId, responseId);
+              }
               return new Response(JSON.stringify(parsed.response), {
                 status: response.status,
                 statusText: response.statusText,
@@ -279,7 +428,7 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           if (signal?.aborted) throw lastError;
-          if (endpointIndex < ENDPOINT_FALLBACKS.length - 1) {
+          if (endpointIndex < endpoints.length - 1) {
             endpointIndex++;
             continue;
           }

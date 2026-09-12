@@ -17,6 +17,7 @@ import {
   readMeta,
   writeMeta,
   resolveStoredAccessToken,
+  getAuthCredentialsFor,
   DEFAULT_PROJECT_ID,
   OAUTH_DUMMY_KEY,
 } from "./auth/index.js";
@@ -208,6 +209,44 @@ function createAuthHook(
             }
           }
           return projectId || DEFAULT_PROJECT_ID;
+        },
+        async rotateAccount() {
+          // Sibling account = the other Antigravity provider id in auth.json
+          // (google-antigravity <-> antigravity). Only rotate when it holds a
+          // distinct Google account (different refresh token).
+          const siblingId =
+            providerId === PRIMARY_PROVIDER_ID ? ALIAS_PROVIDER_ID : PRIMARY_PROVIDER_ID;
+          const current = await getAuth();
+          const sibling = getAuthCredentialsFor(siblingId);
+          if (!sibling?.refresh || sibling.refresh === current?.refresh) return null;
+
+          let access = sibling.access;
+          if (sibling.expires && sibling.expires < Date.now() + 60_000) {
+            try {
+              const json = await refreshAccessToken(sibling.refresh);
+              access = json.access_token;
+              if (client?.auth?.set) {
+                await client.auth.set({
+                  path: { id: siblingId },
+                  body: {
+                    type: "oauth",
+                    access,
+                    refresh: json.refresh_token || sibling.refresh,
+                    expires: toExpires(json.expires_in ?? 3600),
+                    accountId: sibling.accountId,
+                    enterpriseUrl: sibling.enterpriseUrl,
+                  },
+                });
+              }
+            } catch {
+              return null;
+            }
+          }
+
+          const projectId = sibling.accountId
+            ? sibling.accountId
+            : ((await discoverProject(access).catch(() => "")) || DEFAULT_PROJECT_ID);
+          return { accessToken: access, projectId };
         },
       });
 
