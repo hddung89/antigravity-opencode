@@ -11,8 +11,12 @@ import { getSensitiveWords, obfuscateSensitiveWords } from "./sensitive-words.js
 
 export const ANTIGRAVITY_PROMPT_REWRITES = [
   { from: /You are a Claude agent, built on Anthropic's Claude Agent SDK\./gi, to: "" },
+  // OpenCode's provider-prefixed model ids never appear in real client traffic.
+  { from: /google-antigravity\//gi, to: "" },
   {
-    from: /opencode/gi,
+    // Word-boundary match: do not mangle paths like `antigravity-opencode`
+    // or `~/.config/opencode/` that merely contain the substring.
+    from: /(?<![\w/-])opencode(?![\w-])/gi,
     to: (m: string) => (m === "OpenCode" ? "Antigravity" : m === "OPENCODE" ? "ANTIGRAVITY" : "antigravity"),
   },
 ];
