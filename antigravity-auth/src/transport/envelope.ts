@@ -19,6 +19,7 @@ import { dereferenceSchema, ensureRootObjectSchema, sanitizeForOpenApi } from ".
 import { sanitizeSystemInstruction } from "../utils/system.js";
 import { getAntigravityVersion } from "./version.js";
 import { buildSessionEnvelope } from "./session.js";
+import { resolveThoughtSignatureWithFallback } from "./thought-signature.js";
 import type { AntigravityEnvelope, GeminiContent, GeminiPart } from "../types/index.js";
 
 export function isClaudeModel(modelId: string): boolean {
@@ -164,9 +165,14 @@ export function adaptToolsForModel(
   });
 }
 
-export function postProcessContents(contents: GeminiContent[], modelId: string): GeminiContent[] {
+export function postProcessContents(
+  contents: GeminiContent[],
+  modelId: string,
+  options: { sessionId?: string } = {},
+): GeminiContent[] {
   if (!Array.isArray(contents)) return contents;
   const gemini3 = isGemini3Model(modelId);
+  const claudeThinking = isClaudeThinkingModel(modelId);
   const needIds = requiresToolCallId(modelId);
   let toolCounter = 0;
   const lastToolCallIds = new Map<string, string>();
@@ -209,8 +215,31 @@ export function postProcessContents(contents: GeminiContent[], modelId: string):
             }
           }
           next.functionCall = fc;
-          if (gemini3 && isFirstToolCall && !next.thoughtSignature && !fc.thoughtSignature) {
-            next.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+          const hasSig = Boolean(next.thoughtSignature || fc.thoughtSignature);
+          if (!hasSig) {
+            // Try multi-turn cache first
+            const cached = resolveThoughtSignatureWithFallback(
+              options.sessionId,
+              fc.id,
+              fc.name,
+              { fallback: false },
+            );
+            if (cached) {
+              next.thoughtSignature = cached;
+            } else if (gemini3 && isFirstToolCall) {
+              next.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+            } else if (gemini3 || claudeThinking) {
+              // Multi-turn thought signature fallback when orphaned/untracked
+              const fallback = resolveThoughtSignatureWithFallback(
+                options.sessionId,
+                fc.id,
+                fc.name,
+                { fallback: true },
+              );
+              if (fallback) {
+                next.thoughtSignature = fallback;
+              }
+            }
           }
           isFirstToolCall = false;
         }
@@ -240,13 +269,14 @@ export function postProcessContents(contents: GeminiContent[], modelId: string):
 export function postProcessGeminiBody(
   geminiBody: Record<string, unknown>,
   modelId: string,
+  options: { sessionId?: string } = {},
 ): Record<string, unknown> {
   const body = { ...geminiBody };
   if (Array.isArray(body.tools)) {
     body.tools = adaptToolsForModel(body.tools, modelId);
   }
   if (Array.isArray(body.contents)) {
-    body.contents = postProcessContents(body.contents as GeminiContent[], modelId);
+    body.contents = postProcessContents(body.contents as GeminiContent[], modelId, options);
   }
   if (body.generationConfig && typeof body.generationConfig === "object") {
     body.generationConfig = sanitizeGenerationConfig(
@@ -300,10 +330,20 @@ export function buildEnvelope(
 ): AntigravityEnvelope {
   const isAntigravity = opts.isAntigravity !== false;
   const wireModelId = resolveWireModelId(opts.modelId);
-  let request = postProcessGeminiBody({ ...geminiBody }, wireModelId);
-
+  let request = postProcessGeminiBody({ ...geminiBody }, wireModelId, {
+    sessionId: opts.sessionId,
+  });
   if (isAntigravity) {
     request = sanitizeSystemInstruction(request);
+  }
+
+  // Google One AI Credits Protection:
+  // Cloud Code Assist will deduct from paid Google One AI Credits if `enabledCreditTypes`
+  // includes "GOOGLE_ONE_AI". By default, strip this field to protect user credits.
+  // Opt-in only when explicitly allowed via OPENCODE_AGY_ENABLE_G1_CREDITS=1.
+  const enableG1Credits = process.env.OPENCODE_AGY_ENABLE_G1_CREDITS === "1";
+  if (!enableG1Credits) {
+    delete request.enabledCreditTypes;
   }
 
   let requestId: string;

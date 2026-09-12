@@ -97,3 +97,24 @@ export function parseAntigravityRateLimitReason(
   if (ANTIGRAVITY_MODEL_QUOTA_PATTERN.test(errorText)) return "QUOTA_EXHAUSTED";
   return undefined;
 }
+
+/**
+ * Format human-readable warning/explanation for Antigravity rate limit reasons,
+ * emphasizing Google One AI Credits protection when active.
+ */
+export function formatRateLimitWarning(reason: AntigravityRateLimitReason | undefined): string {
+  if (reason === "INSUFFICIENT_G1_CREDITS_BALANCE") {
+    return "Google Antigravity quota exhausted and Google One AI Credits balance is insufficient.";
+  }
+  if (reason === "QUOTA_EXHAUSTED") {
+    const creditsProtected = process.env.OPENCODE_AGY_ENABLE_G1_CREDITS !== "1";
+    if (creditsProtected) {
+      return "Google Antigravity model quota exhausted. Google One AI Credits protection is ACTIVE (paid credits will not be charged).";
+    }
+    return "Google Antigravity model quota exhausted.";
+  }
+  if (reason === "RATE_LIMIT_EXCEEDED") {
+    return "Google Antigravity rate limit exceeded. Please wait before retrying.";
+  }
+  return "Google Antigravity request rate limited.";
+}

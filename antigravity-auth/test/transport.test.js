@@ -21,6 +21,9 @@ import {
   dereferenceSchema,
   ensureRootObjectSchema,
   prewarmConnection,
+  recordThoughtSignature,
+  clearThoughtSignatureCache,
+  DEFAULT_THINKING_AG_SIGNATURE,
 } from "../transport.js";
 import GoogleAntigravityAuthPlugin from "../plugin.js";
 import { generatePKCE, buildAuthUrl, toExpires } from "../oauth.js";
@@ -678,5 +681,75 @@ describe("native architecture improvements", () => {
     assert.match(headers["User-Agent"], /^antigravity\/ide\/2\.11\.0/);
     assert.equal(headers["X-Goog-Api-Client"], undefined, "Expected X-Goog-Api-Client to be stripped");
     assert.equal(headers["x-request-source"], "local");
+  });
+
+  it("protects Google One AI Credits by stripping enabledCreditTypes by default", () => {
+    delete process.env.OPENCODE_AGY_ENABLE_G1_CREDITS;
+    const env = buildEnvelope(
+      {
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+        enabledCreditTypes: ["GOOGLE_ONE_AI"],
+      },
+      { projectId: "test-proj", modelId: "gemini-3-flash" },
+    );
+    assert.equal(env.request?.enabledCreditTypes, undefined, "Expected enabledCreditTypes to be stripped by default");
+  });
+
+  it("allows Google One AI Credits when OPENCODE_AGY_ENABLE_G1_CREDITS=1 is set", () => {
+    process.env.OPENCODE_AGY_ENABLE_G1_CREDITS = "1";
+    try {
+      const env = buildEnvelope(
+        {
+          contents: [{ role: "user", parts: [{ text: "hello" }] }],
+          enabledCreditTypes: ["GOOGLE_ONE_AI"],
+        },
+        { projectId: "test-proj", modelId: "gemini-3-flash" },
+      );
+      assert.deepEqual(env.request?.enabledCreditTypes, ["GOOGLE_ONE_AI"]);
+    } finally {
+      delete process.env.OPENCODE_AGY_ENABLE_G1_CREDITS;
+    }
+  });
+
+  it("recovers missing thought signature from cache or injects fallback", () => {
+    const sessionId = "session-sig-test-123";
+    clearThoughtSignatureCache();
+
+    // First tool call in Gemini 3 turn gets SKIP_THOUGHT_SIGNATURE sentinel when unsigned
+    const singleCall = [
+      {
+        role: "model",
+        parts: [
+          {
+            functionCall: { name: "editFile", args: { path: "foo.ts" }, id: "call_1" },
+          },
+        ],
+      },
+    ];
+    const outSingle = postProcessContents(singleCall, "gemini-3.7-flash-high", { sessionId });
+    assert.equal(outSingle[0].parts[0].thoughtSignature, SKIP_THOUGHT_SIGNATURE);
+
+    // Subsequent (multi-tool) call in the same turn gets fallback signature if uncached
+    const multiCalls = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { name: "tool1", args: {}, id: "call_1" } },
+          { functionCall: { name: "tool2", args: {}, id: "call_2" } },
+        ],
+      },
+    ];
+    const outMulti = postProcessContents(multiCalls, "gemini-3.7-flash-high", { sessionId });
+    assert.equal(outMulti[0].parts[0].thoughtSignature, SKIP_THOUGHT_SIGNATURE);
+    assert.equal(outMulti[0].parts[1].thoughtSignature, DEFAULT_THINKING_AG_SIGNATURE);
+
+    // With recorded signature in cache, cached signature is recovered for any turn
+    const recordedSig = "sig_from_previous_model_turn_abc";
+    recordThoughtSignature(sessionId, "call_1", recordedSig);
+
+    const outWithCached = postProcessContents(singleCall, "gemini-3.7-flash-high", { sessionId });
+    assert.equal(outWithCached[0].parts[0].thoughtSignature, recordedSig);
+
+    clearThoughtSignatureCache();
   });
 });

@@ -11,6 +11,7 @@ import { buildEnvelope, getAntigravityHeaders } from "./envelope.js";
 import { unwrapSseResponseStream } from "./stream.js";
 import { ensureAntigravityVersion } from "./version.js";
 import { getLastGoodEndpoint, recordExecutionId, setLastGoodEndpoint } from "./session.js";
+import { recordThoughtSignature } from "./thought-signature.js";
 import type { AntigravityFetchDeps } from "../types/index.js";
 
 const MAX_RETRIES = 3;
@@ -381,7 +382,12 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
             }
             let sseStream = unwrapSseResponseStream(
               prependChunk(firstChunk, response.body),
-              (responseId) => { if (sessionId) recordExecutionId(sessionId, responseId); },
+              {
+                onResponseId: (responseId) => { if (sessionId) recordExecutionId(sessionId, responseId); },
+                onThoughtSignature: (identifier, signature) => {
+                  if (sessionId) recordThoughtSignature(sessionId, identifier, signature);
+                },
+              },
             );
             if (shouldCloak) {
               const transform = new TransformStream({
@@ -410,6 +416,26 @@ export function createAntigravityFetch(deps: AntigravityFetchDeps) {
               const responseId = (parsed.response as Record<string, unknown>)?.responseId;
               if (typeof responseId === "string" && responseId) {
                 if (sessionId) recordExecutionId(sessionId, responseId);
+              }
+              // Extract thought signatures from non-streaming response candidates
+              const candidateList = (parsed.response as Record<string, unknown>)?.candidates;
+              if (sessionId && Array.isArray(candidateList)) {
+                for (const cand of candidateList) {
+                  const candObj = cand as Record<string, unknown> | undefined;
+                  const content = candObj?.content as Record<string, unknown> | undefined;
+                  const parts = content?.parts;
+                  if (Array.isArray(parts)) {
+                    for (const part of parts) {
+                      const partObj = part as Record<string, unknown> | undefined;
+                      const fc = partObj?.functionCall as Record<string, unknown> | undefined;
+                      const sig = partObj?.thoughtSignature || fc?.thoughtSignature;
+                      if (typeof sig === "string" && sig) {
+                        if (typeof fc?.id === "string") recordThoughtSignature(sessionId, fc.id, sig);
+                        if (typeof fc?.name === "string") recordThoughtSignature(sessionId, fc.name, sig);
+                      }
+                    }
+                  }
+                }
               }
               return new Response(JSON.stringify(parsed.response), {
                 status: response.status,
